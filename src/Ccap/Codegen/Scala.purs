@@ -773,16 +773,24 @@ typeDecl outputMode typDecl@(Ast.TypeDecl { name, topType: tt, annots: an, param
     recordFields <- traverse recordFieldEncoder props
     classDefinition <- do
       let
-        addExtendsHasOccId =
-          outputMode == TopLevelCaseClass
-            && isPrimaryClass (objectName mod) typDecl
-            && hasOccId props
+        traits =
+          compact
+            [ if outputMode == TopLevelCaseClass
+                && isPrimaryClass (objectName mod) typDecl
+                && hasOccId props then
+                Just "HasOccId"
+              else
+                Nothing
+            ]
       recordFieldTypes <- traverse (recordFieldType outputMode true) props
       pure
         $ parenVStrings
             ("final case class " <> typeDescr name (typeParams pp))
             ","
-            (if addExtendsHasOccId then " extends HasOccId" else "")
+            ( case traits of
+                [] -> ""
+                ts -> "extends " <> intercalate " with " ts
+            )
             recordFieldTypes
     let
       modName = objectName mod

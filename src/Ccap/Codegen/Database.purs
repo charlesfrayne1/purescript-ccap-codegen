@@ -12,15 +12,17 @@ import Data.Array.NonEmpty (NonEmptyArray)
 import Data.Array.NonEmpty as NonEmptyArray
 import Data.Either (note)
 import Data.Foldable as Foldable
+import Data.Function (on)
 import Data.Maybe (Maybe(..), isNothing, maybe)
 import Data.Monoid as Monoid
 import Data.String as String
 import Data.Traversable (for)
+import Data.Tuple (Tuple(..))
 import Database.PostgreSQL (Connection, PGError(..))
 import Database.PostgreSQL.Aff (Query(..))
 import Database.PostgreSQL.PG (query, withConnection)
 import Database.PostgreSQL.Pool (Pool)
-import Database.PostgreSQL.Row (Row0(..), Row1(..), Row3(..), Row6(..))
+import Database.PostgreSQL.Row (Row0(..), Row1(..), Row3(..), Row4(..), Row6(..))
 import Effect.Aff (Aff)
 import Parsing (Position(..))
 
@@ -42,6 +44,11 @@ type Config
   = { dbManagedColumns :: Maybe (Array String)
     , scalaPkg :: String
     , pursPkg :: String
+    }
+
+type ForeignKey
+  = { foreignTable :: String
+    , attrPairs :: NonEmptyArray (Tuple String String)
     }
 
 aliasedTypes :: Array AliasedType
@@ -151,15 +158,15 @@ domainModule pools { scalaPkg, pursPkg } = do
 
   sql =
     """
-          select distinct domain_name, data_type, character_maximum_length
-          from information_schema.domains
-          where domain_schema in ('public', 'dbtran') and
-                  data_type in ('numeric', 'character varying', 'character',
-                                'integer', 'smallint', 'text', 'uuid',
-                                'boolean', 'date', 'time without time zone',
-                                'timestamp with time zone', 'interval') and
-                  domain_name not in ('BatchIDT', 'XMLT')
-          """
+    select distinct domain_name, data_type, character_maximum_length
+    from information_schema.domains
+    where domain_schema in ('public', 'dbtran') and
+            data_type in ('numeric', 'character varying', 'character',
+                          'integer', 'smallint', 'text', 'uuid',
+                          'boolean', 'date', 'time without time zone',
+                          'timestamp with time zone', 'interval') and
+            domain_name not in ('BatchIDT', 'XMLT')
+    """
 
 type PartialDomainsModule
   = { types :: NonEmptyArray Cst.TypeDecl
@@ -176,7 +183,10 @@ type DbColumn
     , isPrimaryKey :: Boolean
     }
 
-dbRowToColumn :: Maybe (Array String) -> Row6 String String (Maybe String) (Maybe Int) String Boolean -> DbColumn
+dbRowToColumn ::
+  Maybe (Array String) ->
+  Row6 String String (Maybe String) (Maybe Int) String Boolean ->
+  DbColumn
 dbRowToColumn dbManagedColumns (Row6 columnName dataType domainName charMaxLen isNullable isPrimaryKey) =
   { columnName
   , dataType
@@ -204,8 +214,9 @@ tableModule pool { dbManagedColumns, scalaPkg, pursPkg } tableName =
     $ withConnection runExceptT pool \conn -> do
         columns <- queryColumns dbManagedColumns tableName conn
         nelColumns <- except (note (ConversionError ("Expected at least one column. Does the \"" <> tableName <> "\" table exist?")) (NonEmptyArray.fromArray columns))
+        foreignKeys <- queryFKs tableName conn
         let
-          decl = tableType tableName (nelColumns `NonEmptyArray.snoc` occIdColumn)
+          decl = tableType tableName (nelColumns `NonEmptyArray.snoc` occIdColumn) foreignKeys
         pure
           { types: NonEmptyArray.singleton decl
           , imports: tableImports decl # Array.sort
@@ -224,6 +235,26 @@ tableImports =
     >>> Array.catMaybes
     >>> Array.nub
     >>> map (\(Cst.ModuleRef name) -> Cst.Import emptyPos name)
+
+tableType :: String -> NonEmptyArray DbColumn -> Array ForeignKey -> Cst.TypeDecl
+tableType tableName columns foreignKeys =
+  Cst.TypeDecl
+    { position: emptyPos
+    , name: tableName
+    , topType: Cst.Record (map dbRecordProp columns)
+    , params: []
+    , annots:
+        foreignKeys
+          <#> \{ foreignTable, attrPairs } ->
+              Cst.Annotation "ForeignKey" emptyPos
+                ( Array.cons
+                    (Cst.AnnotationParam foreignTable emptyPos Nothing)
+                    ( map
+                        (\(Tuple cc fc) -> Cst.AnnotationParam cc emptyPos (Just fc))
+                        (NonEmptyArray.toArray attrPairs)
+                    )
+                )
+    }
 
 queryColumns :: Maybe (Array String) -> String -> Connection -> ExceptT PGError Aff (Array DbColumn)
 queryColumns dbManagedColumns tableName conn = do
@@ -261,15 +292,63 @@ queryColumns dbManagedColumns tableName conn = do
     ORDER BY c.ordinal_position ;
     """
 
-tableType :: String -> NonEmptyArray DbColumn -> Cst.TypeDecl
-tableType tableName columns =
-  Cst.TypeDecl
-    { position: emptyPos
-    , name: tableName
-    , topType: Cst.Record (map dbRecordProp columns)
-    , annots: []
-    , params: []
-    }
+queryFKs :: String -> Connection -> ExceptT PGError Aff (Array ForeignKey)
+queryFKs tableName conn = do
+  results <- query conn (Query sql) (Row1 tableName)
+  let
+    keyBits =
+      results
+        <#> \(Row4 (keyID :: Int) foreignTable foreignAttr attr) ->
+            { foreignTable
+            , keyID
+            , attrPair: Tuple foreignAttr attr
+            }
+
+    keys = Array.groupBy (on eq _.foreignTable) keyBits
+
+    unambiguousKeys =
+      flip Array.mapMaybe keys \key ->
+        let
+          distinctIDs = Array.nubBy (comparing _.keyID) (NonEmptyArray.toArray key)
+        in
+          case distinctIDs of
+            [ _ ] ->
+              Just
+                { foreignTable: (NonEmptyArray.head key).foreignTable
+                , attrPairs: key <#> _.attrPair
+                }
+            _ -> Nothing
+  pure unambiguousKeys
+  where
+  sql =
+    """
+    SELECT
+        fr.id
+      , pr.relation as "parent_table"
+      , pa.name as "parent_attr"
+      , ca.name as "child_attr"
+
+    FROM "Relation" cr
+
+    JOIN "ForeignRef" fr
+      ON fr."refBy" = cr."id"
+
+    JOIN "RefAttrPair" rap
+      ON fr.id = rap."foreignRef"
+
+    JOIN "Relation" pr
+      ON fr."refTo" = pr."id"
+
+    JOIN "Attribute" pa
+      ON rap."refTo" = pa.relation AND
+         rap."attrTo" = pa.id
+
+    JOIN "Attribute" ca
+      ON rap."refBy" = ca.relation AND
+         rap."attrBy" = ca.id
+         
+    WHERE cr.table_name = $1 ;
+    """
 
 dbRecordProp :: DbColumn -> Cst.RecordProp
 dbRecordProp col@{ columnName, domainName, dataType, isDbManaged, isNullable, isPrimaryKey } =
